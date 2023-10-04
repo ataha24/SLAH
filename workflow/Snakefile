@@ -1,0 +1,124 @@
+from os.path import join
+import itertools
+import pandas as pd
+configfile: 'config/config.yml'
+
+df = pd.read_csv(join(config['bids_dir'],'participants.tsv'),delimiter='\t')
+df = df.iloc[:, [0]]
+data_list = [entry.replace('sub-', '') for entry in df[f'{df.columns[0]}'].tolist()]
+sorted_data_list = sorted(data_list)
+
+rule all:
+    input:
+        expand(
+            join(config['output_dir'],'qc','sub-{subject}','anat','sub-{subject}_registration.html'),
+            subject=sorted_data_list
+        ) +
+        expand(
+            join(config['output_dir'], 'c3d/sub-{subject}/anat/sub-{subject}_desc-lesioncentroid_T1w.fcsv'),
+            subject=sorted_data_list
+        ) +
+        expand(
+            join(config['output_dir'], 'coregistration/sub-{subject}/anat/sub-{subject}_postSLAH_to_preSLA.tfm'),
+            subject=sorted_data_list
+        ) +
+        expand(
+            join(config['output_dir'],'normalization/sub-{subject}/anat/sub-{subject}_desc-affine_postSLAH-to-MNI.tfm'),
+            subject=sorted_data_list
+
+        )
+
+
+rule invert_seg: 
+    input: 
+    	segmentation=join(config['bids_dir'], 'sub-{subject}/anat/Segmentation.nii.gz')
+    output: 
+        lesion=join(config['output_dir'], 'c3d/sub-{subject}/anat/sub-{subject}_desc-lesion_T1w.nii.gz'),
+        invlesion=join(config['output_dir'], 'c3d/sub-{subject}/anat/sub-{subject}_desc-invlesion_T1w.nii.gz'),
+    shell:
+    	"cp {input.segmentation} {output.lesion} &&"
+   	"c3d {output.lesion} -thresh 0 0 1 0 {output.invlesion}"
+
+rule co_reg: 
+    input: 
+    	postSLAH=join(config['bids_dir'], 'sub-{subject}/anat/sub-{subject}_acq-postSLAH_T1w.nii.gz'),
+    	preSLAH=join(config['bids_dir'], 'sub-{subject}/anat/sub-{subject}_acq-preSLAH_T1w.nii.gz'),
+    	segmentation=rules.invert_seg.output.invlesion,
+    	lesion = rules.invert_seg.output.lesion,
+    output: 
+        brain=join(config['output_dir'], 'coregistration/sub-{subject}/anat/sub-{subject}_acq-postSLAH_space-preSLAH_T1w.nii.gz'),
+        mask=join(config['output_dir'],  'coregistration/sub-{subject}/anat/sub-{subject}_desc-lesion_space-preSLAH.nii.gz'),
+        xfm_ras=join(config['output_dir'],'coregistration/sub-{subject}/anat/sub-{subject}_postSLAH_to_preSLAH.txt'),
+    shell:
+        "reg_aladin -flo {input.postSLAH} -ref {input.preSLAH} -rigOnly -fmask {input.segmentation} -res {output.brain} -aff {output.xfm_ras} &&"
+        "reg_resample -ref {input.preSLAH} -flo {input.lesion} -res {output.mask} -aff {output.xfm_ras} -inter 0"
+
+rule SLAH2mni:
+    input: 
+        flo = join(config['bids_dir'], 'sub-{subject}/anat/sub-{subject}_acq-preSLAH_T1w.nii.gz'),
+        ref = config['template_t1w'],
+        seg = rules.co_reg.output.mask, 
+        flopostslah=rules.co_reg.output.brain,
+    output: 
+        affine_xfm_ras = join(config['output_dir'],'normalization/sub-{subject}/anat/sub-{subject}_desc-affine_postSLAH-to-MNI.txt'),
+        xfm_deform = join(config['output_dir'],'normalization/sub-{subject}/anat/sub-{subject}_desc-warp_postSLAH_to_MNI.nii.gz'),
+        xfm_deform_inv = join(config['output_dir'],'normalization/sub-{subject}/anat/sub-{subject}_desc-invwarp_postSLAH_to_MNI.nii.gz'),
+        warped_subj_greedy_post= join(config['output_dir'], 'normalization/sub-{subject}/anat/sub-{subject}_acq-postSLAH_desc-greedy_space-MNI_T1w.nii.gz'),
+        warped_subj_greedy = join(config['output_dir'], 'normalization/sub-{subject}/anat/sub-{subject}_acq-preSLAH_desc-greedy_space-MNI_T1w.nii.gz'),
+        lesion_mni=join(config['output_dir'],  'normalization/sub-{subject}/anat/sub-{subject}_desc-lesion_space-MNI.nii.gz'),
+    params:
+    	n_iterations_affine=config['atlas_reg']['greedy']['n_iterations_affine'],
+	n_iterations_deform=config['atlas_reg']['greedy']['n_iterations_deform'],
+	grad_sigma=config['atlas_reg']['greedy']['grad_sigma'],
+	warp_sigma=config['atlas_reg']['greedy']['warp_sigma'],
+	
+    shell:
+        'greedy -d 3 -a -ia-image-centers -m MI -i {input.ref} {input.flo} -o {output.affine_xfm_ras} -n {params.n_iterations_affine}&&'
+        'greedy -d 3 -m MI -i {input.ref} {input.flo} -it {output.affine_xfm_ras} -o {output.xfm_deform} -oinv {output.xfm_deform_inv} -n {params.n_iterations_deform} -s {params.grad_sigma} {params.warp_sigma} &&'
+        'greedy -d 3 -rf {input.ref} -rm {input.flo} {output.warped_subj_greedy} -r {output.xfm_deform} {output.affine_xfm_ras} &&'
+        'greedy -d 3 -rf {input.ref} -rm {input.flopostslah} {output.warped_subj_greedy_post} -ri LABEL 0.2vox -rm {input.seg} {output.lesion_mni} -r {output.xfm_deform} {output.affine_xfm_ras}'
+
+rule c3d_centroid:
+    input:
+        segmentation = rules.SLAH2mni.output.lesion_mni
+    output:
+        fcsv = join(config['output_dir'], 'c3d/sub-{subject}/anat/sub-{subject}_desc-lesioncentroid_T1w.fcsv')
+    shell:
+        """
+        SEGMENTATION={input.segmentation}
+        OUTPUT_FCSV={output.fcsv}
+
+        outputcent=$(c3d $SEGMENTATION -centroid | grep "CENTROID_MM")
+        coords=$(echo $outputcent | awk -F'[\\[\\]]' '{{print $2}}' | tr -d ' ')
+        IFS=',' read -ra ADDR <<< "$coords"
+        x=${{ADDR[0]}}
+        y=${{ADDR[1]}}
+        z=${{ADDR[2]}}
+        echo -e "# Markups fiducial file version = 4.10\n# CoordinateSystem = 0\n# columns = id,x,y,z,ow,ox,oy,oz,vis,sel,lock,label,desc,associatedNodeID\nvtkMRMLMarkupsFiducialNode_1,$x,$y,$z,0.000,0.000,0.000,1.000,1,1,0,1,,vtkMRMLScalarVolumeNode1" > $OUTPUT_FCSV
+        """
+
+rule convert_T1w_xfm_tfm:
+    input: 
+    	xfm=rules.co_reg.output.xfm_ras,
+    output:
+    	tfm_ras=join(config['output_dir'],'coregistration/sub-{subject}/anat/sub-{subject}_postSLAH_to_preSLA.tfm'),
+    script: 
+        './scripts/convert_xfm_tfm.py' 
+     
+rule convert_T1w_xfm_tfm_greedy:
+    input: 
+    	xfm_greedy=rules.SLAH2mni.output.affine_xfm_ras,
+    output:
+    	tfm_raw_greedy = join(config['output_dir'],'normalization/sub-{subject}/anat/sub-{subject}_desc-affine_postSLAH-to-MNI.tfm'),
+    script: 
+        './scripts/convert_xfm_tfm_greedy.py'   
+rule regQC: 
+    input: 
+        mni_image = rules.SLAH2mni.output.warped_subj_greedy, 
+        MNI_temp = config['template_t1w'],
+        image_post = rules.co_reg.output.brain,
+        image_pre = join(config['bids_dir'], 'sub-{subject}/anat/sub-{subject}_acq-preSLAH_T1w.nii.gz'),
+    output: 
+        html = join(config['output_dir'],'qc','sub-{subject}','anat','sub-{subject}_registration.html'),
+    script: 
+    	'./scripts/reg_qc.py'  
